@@ -23,7 +23,7 @@ else:
 # ─── 2. Install Python dependencies ───────────────────────────────────────────
 print("\n[2/4] Installing Python dependencies...")
 os.system(
-    "pip install -q streamlit tensorflow pillow numpy"
+    "pip install -q streamlit tensorflow pillow numpy h5py"
 )
 print("      ✅ Dependencies installed.")
 

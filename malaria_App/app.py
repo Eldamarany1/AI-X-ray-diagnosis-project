@@ -2,6 +2,7 @@
 import streamlit as st
 # pyrefly: ignore [missing-import]
 import numpy as np
+from pathlib import Path
 from PIL import Image
 import time
 
@@ -192,11 +193,11 @@ def load_keras_model():
     import tensorflow as tf
     import h5py
     import numpy as np
-    MODEL_PATH = "malaria_cell_parasite_prediction_model.h5"
+    MODEL_PATH = Path(__file__).with_name("malaria_cell_parasite_prediction_model.h5")
 
     # ── Strategy 1: plain Keras load (works if Keras version matches) ─────────
     try:
-        m = tf.keras.models.load_model(MODEL_PATH, compile=False)
+        m = tf.keras.models.load_model(str(MODEL_PATH), compile=False)
         return m, None
     except Exception:
         pass
@@ -219,7 +220,7 @@ def load_keras_model():
         model.predict(np.zeros((1, 224, 224, 3), dtype=np.float32), verbose=0)
 
         # Inject dense weights from the h5 file
-        with h5py.File(MODEL_PATH, "r") as f:
+        with h5py.File(str(MODEL_PATH), "r") as f:
             mw = f["model_weights"]
             kernel = np.array(mw["dense"]["sequential"]["dense"]["kernel"])  # (1280,1)
             bias   = np.array(mw["dense"]["sequential"]["dense"]["bias"])    # (1,)
@@ -228,6 +229,111 @@ def load_keras_model():
         return model, None
     except Exception as e:
         return None, f"Failed to load model: {e}"
+
+
+BILINEAR_RESAMPLE = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
+PARASITIZED_THRESHOLD = 0.285
+
+
+def normalise_map(values):
+    values = values.astype(np.float32)
+    values = values - np.min(values)
+    max_value = np.max(values)
+    if max_value > 0:
+        values = values / max_value
+    return values
+
+
+def get_feature_layer(model):
+    base_model = model.layers[0]
+    for layer in reversed(base_model.layers):
+        try:
+            if len(layer.output.shape) == 4:
+                return base_model, layer
+        except Exception:
+            continue
+    raise ValueError("No spatial feature layer found for Grad-CAM.")
+
+
+def apply_classifier_head(model, features):
+    x = features
+    for layer in model.layers[1:]:
+        try:
+            x = layer(x, training=False)
+        except TypeError:
+            x = layer(x)
+    return x
+
+
+def make_gradcam_heatmap(model, img_batch, predicted_class_index):
+    import tensorflow as tf
+
+    base_model, feature_layer = get_feature_layer(model)
+    feature_model = tf.keras.Model(
+        inputs=base_model.inputs,
+        outputs=[feature_layer.output, base_model.output],
+    )
+
+    with tf.GradientTape() as tape:
+        conv_outputs, base_outputs = feature_model(img_batch, training=False)
+        predictions = apply_classifier_head(model, base_outputs)
+        uninfected_score = predictions[:, 0]
+        target_score = uninfected_score if predicted_class_index == 1 else 1.0 - uninfected_score
+
+    grads = tape.gradient(target_score, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_outputs = conv_outputs[0]
+    heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
+    heatmap = tf.maximum(heatmap, 0)
+    heatmap = heatmap / (tf.reduce_max(heatmap) + tf.keras.backend.epsilon())
+    return heatmap.numpy(), feature_layer.name
+
+
+def colorize_heatmap(heatmap):
+    heatmap = normalise_map(heatmap)
+    red = np.clip(255 * np.minimum(1.0, heatmap * 2.2), 0, 255)
+    green = np.clip(255 * np.maximum(0.0, (heatmap - 0.28) / 0.72), 0, 255)
+    blue = np.clip(120 * (1.0 - heatmap), 0, 120)
+    rgb = np.stack([red, green, blue], axis=-1).astype(np.uint8)
+    return Image.fromarray(rgb)
+
+
+def build_gradcam_images(original_image, heatmap, alpha=0.48):
+    heatmap = normalise_map(heatmap)
+    heatmap_image = colorize_heatmap(heatmap).resize(original_image.size, BILINEAR_RESAMPLE)
+    alpha_mask = Image.fromarray((heatmap * 255).astype(np.uint8)).resize(
+        original_image.size,
+        BILINEAR_RESAMPLE,
+    )
+
+    base = np.asarray(original_image).astype(np.float32)
+    heat = np.asarray(heatmap_image).astype(np.float32)
+    mask = (np.asarray(alpha_mask).astype(np.float32) / 255.0) ** 1.35
+    overlay = base * (1.0 - alpha * mask[..., None]) + heat * (alpha * mask[..., None])
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+    return heatmap_image, Image.fromarray(overlay)
+
+
+def make_activation_grid(model, img_batch, max_maps=8, tile_size=96):
+    import tensorflow as tf
+
+    base_model, feature_layer = get_feature_layer(model)
+    activation_model = tf.keras.Model(inputs=base_model.inputs, outputs=feature_layer.output)
+    activations = activation_model(img_batch, training=False)[0].numpy()
+    channel_strength = np.mean(np.abs(activations), axis=(0, 1))
+    selected_channels = np.argsort(channel_strength)[-max_maps:][::-1]
+
+    columns = 4
+    rows = int(np.ceil(len(selected_channels) / columns))
+    grid = Image.new("RGB", (columns * tile_size, rows * tile_size), color=(8, 11, 26))
+    for index, channel in enumerate(selected_channels):
+        feature_map = normalise_map(activations[:, :, channel])
+        tile = colorize_heatmap(feature_map).resize((tile_size, tile_size), BILINEAR_RESAMPLE)
+        x = (index % columns) * tile_size
+        y = (index // columns) * tile_size
+        grid.paste(tile, (x, y))
+
+    return grid, feature_layer.name
 
 
 # ─── Hero Header ──────────────────────────────────────────────────────────────
@@ -325,8 +431,10 @@ with col_right:
         # ── Model inference ───────────────────────────────────────────────
         #   Class mapping (from training): 0 = Parasitized, 1 = Uninfected
         raw_score = float(model.predict(img_batch, verbose=0)[0][0])
+        parasitized_score = 1.0 - raw_score
+        predicted_class_index = 0 if parasitized_score >= PARASITIZED_THRESHOLD else 1
 
-        if raw_score >= 0.5:
+        if predicted_class_index == 1:
             # Closer to 1.0 → Uninfected
             label      = "UNINFECTED"
             confidence = raw_score * 100
@@ -340,7 +448,7 @@ with col_right:
         else:
             # Closer to 0.0 → Parasitized
             label      = "PARASITIC INFECTION"
-            confidence = (1.0 - raw_score) * 100
+            confidence = parasitized_score * 100
             card_class = "verdict-parasitized"
             icon       = "⚠️"
             title_color = "#fca5a5"
@@ -361,7 +469,7 @@ with col_right:
                 {confidence:.1f}%
             </div>
             <p style='color:#94a3b8;font-size:0.82rem;margin:0 0 14px;font-weight:500;'>
-                Model Confidence
+                Model Score
             </p>
             <hr style='border:none;border-top:1px solid rgba(255,255,255,0.1);margin:14px 0;'>
             <p style='color:#cbd5e1;line-height:1.65;font-size:0.93rem;margin:0;'>
@@ -371,20 +479,63 @@ with col_right:
         """, unsafe_allow_html=True)
 
         # ── Confidence bar ────────────────────────────────────────────────
-        st.progress(min(int(confidence), 100), text=f"Confidence: {confidence:.1f} %")
+        st.progress(min(int(confidence), 100), text=f"Model score: {confidence:.1f} %")
+
+        # Explainability: Grad-CAM + feature-map debug view
+        try:
+            heatmap, gradcam_layer_name = make_gradcam_heatmap(
+                model,
+                img_batch,
+                predicted_class_index,
+            )
+            heatmap_image, overlay_image = build_gradcam_images(image, heatmap)
+
+            st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
+            st.markdown("<p class='section-heading'>Explainability: Grad-CAM</p>", unsafe_allow_html=True)
+            st.markdown(
+                "<p style='color:#94a3b8;font-size:0.88rem;line-height:1.6;margin-top:-6px;'>"
+                "The highlighted regions contributed most strongly to the model's predicted class. "
+                "This is an attention-style explanation, not medical proof of causality."
+                "</p>",
+                unsafe_allow_html=True,
+            )
+            gradcam_col, heatmap_col = st.columns(2)
+            with gradcam_col:
+                st.image(overlay_image, caption="Grad-CAM overlay", use_column_width=True)
+            with heatmap_col:
+                st.image(heatmap_image, caption="Raw attention heatmap", use_column_width=True)
+
+            with st.expander("Activation map debug view", expanded=False):
+                activation_grid, activation_layer_name = make_activation_grid(model, img_batch)
+                st.image(
+                    activation_grid,
+                    caption=f"Top feature channels from {activation_layer_name}",
+                    use_column_width=True,
+                )
+                st.caption(
+                    "These feature maps are useful for technical inspection, but they are not a "
+                    "clinician-facing explanation of diagnosis."
+                )
+            st.markdown("</div>", unsafe_allow_html=True)
+        except Exception as xai_error:
+            st.warning(f"Grad-CAM explanation could not be generated: {xai_error}")
+            gradcam_layer_name = "unavailable"
 
         # ── Telemetry expander ────────────────────────────────────────────
         with st.expander("📡  Technical Telemetry", expanded=False):
             st.markdown(f"""
             <div class='telemetry'>
                 <span>[MODEL]</span> Architecture  : MobileNetV2 (frozen) + GAP + Dropout(0.2) + Dense(sigmoid)<br>
+                <span>[XAI]</span> Grad-CAM Layer  : {gradcam_layer_name}<br>
                 <span>[MODEL]</span> Trainable Params : 1,281 / 2,259,265 total<br>
                 <span>[INPUT]</span> Upload Size    : {image.size[0]}×{image.size[1]} px<br>
                 <span>[INPUT]</span> Tensor Shape   : (1, 224, 224, 3)<br>
                 <span>[INFER]</span> Raw Sigmoid    : {raw_score:.8f}<br>
+                <span>[INFER]</span> Parasitized Score : {parasitized_score:.8f}<br>
+                <span>[INFER]</span> Parasitized Threshold : {PARASITIZED_THRESHOLD:.3f}<br>
                 <span>[INFER]</span> Class Mapping  : 0 = Parasitized · 1 = Uninfected<br>
                 <span>[RESULT]</span> Predicted Class: {label}<br>
-                <span>[RESULT]</span> Confidence     : {confidence:.4f}%
+                <span>[RESULT]</span> Model Score     : {confidence:.4f}%
             </div>
             """, unsafe_allow_html=True)
 
