@@ -1,7 +1,7 @@
 Here is a complete, professional `README.md` for your Malaria project. It highlights the impressive tech stack you used and explains exactly how the system works. You can copy and paste this directly into your repository and get back to studying.
 
 ---
-
+ 
 ```markdown
 # 🩸 Malaria AI Diagnostic Tool
 
